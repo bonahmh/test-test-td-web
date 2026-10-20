@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hand-tracked 3D box</title>
+<style>
+html,body{margin:0;height:100%;background:#0b0b10;color:#eee;font:14px system-ui,sans-serif;overflow:hidden}
+#stage{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#000}
+video,canvas{position:absolute;inset:0;width:100%;height:100%}
+video{transform:scaleX(-1)}
+#ui{position:absolute;left:0;right:0;top:0;padding:max(8px,env(safe-area-inset-top)) 10px 8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:5;background:linear-gradient(#000a,#0000)}
+button,label.b{background:#fff;color:#111;border:0;border-radius:8px;padding:9px 14px;font-weight:600;font-size:14px}
+#hud{opacity:.85}
+</style>
+<script type="importmap">
+{"imports":{
+"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+"three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"}}
+</script></head>
+<body>
+<div id="ui"><button id="start">Start camera</button>
+<label class="b">Load models<input id="files" type="file" multiple hidden></label>
+<span id="hud">Tap Start</span></div>
+<div id="stage"><video id="vid" playsinline muted></video><canvas id="gl"></canvas></div>
+<script type="module">
+import * as THREE from 'three';
+import {FBXLoader} from 'three/addons/loaders/FBXLoader.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {FilesetResolver, HandLandmarker} from '@mediapipe/tasks-vision';
+
+// ---- tuning ----
+const OPEN_T=.7, CLOSE_T=.4, EASE=.15, SMOOTH=.35, EXT=1.15, CAMZ=8, FOV=50, CUBE=4;
+// ----------------
+const $=id=>document.getElementById(id), vid=$('vid'), stage=$('stage'), hud=$('hud');
+const renderer=new THREE.WebGLRenderer({canvas:$('gl'),alpha:true,antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(FOV,16/9,.1,100); cam.position.z=CAMZ;
+scene.add(new THREE.AmbientLight(0xffffff,1.2));
+const sun=new THREE.DirectionalLight(0xffffff,2); sun.position.set(3,5,6); scene.add(sun);
+const cube=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(CUBE,CUBE,CUBE)),new THREE.LineBasicMaterial({color:0xffffff}));
+scene.add(cube);
+const holder=new THREE.Group(); scene.add(holder);
+
+function resize(){
+  const a=vid.videoWidth&&vid.videoHeight?vid.videoWidth/vid.videoHeight:16/9;
+  const w=Math.min(innerWidth,innerHeight*a), h=w/a;
+  stage.style.width=w+'px'; stage.style.height=h+'px';
+  renderer.setSize(w,h,false); cam.aspect=a; cam.updateProjectionMatrix();
+}
+addEventListener('resize',resize); resize();
+
+// ---- built-in models (used until you load your own) ----
+const rnd=()=>new THREE.Vector3(Math.random()-.5,Math.random()-.5,Math.random()-.5).normalize();
+function flower(){
+  const g=new THREE.Group();
+  const stem=new THREE.Mesh(new THREE.CylinderGeometry(.04,.05,1.5,8),new THREE.MeshStandardMaterial({color:0x2e8b3a}));
+  stem.position.y=-.9; g.add(stem);
+  const pm=new THREE.MeshStandardMaterial({color:0xff5fa2,roughness:.5});
+  for(let i=0;i<7;i++){
+    const a=i/7*Math.PI*2, p=new THREE.Mesh(new THREE.SphereGeometry(.3,16,12),pm);
+    p.scale.set(.5,1.1,.12); p.position.set(Math.cos(a)*.4,Math.sin(a)*.4,0); p.rotation.z=a-Math.PI/2; g.add(p);
+  }
+  const c=new THREE.Mesh(new THREE.SphereGeometry(.18,16,12),new THREE.MeshStandardMaterial({color:0xffd23f})); g.add(c);
+  return g;
+}
+function points(n,fn,size){
+  const pos=new Float32Array(n*3), col=new Float32Array(n*3);
+  for(let i=0;i<n;i++){const r=fn(i); pos.set(r.p,i*3); col.set(r.c,i*3);}
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(pos,3)); geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+  return new THREE.Points(geo,new THREE.PointsMaterial({size,vertexColors:true,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));
+}
+const galaxy=()=>points(2500,i=>{
+  const r=Math.random()**.6*1.5, a=r*3+(i%3)*2.09, s=(Math.random()-.5)*.25*(1.2-r/1.5), c=new THREE.Color().setHSL(.6+r*.15,.8,.55+.3*(1-r/1.5));
+  return {p:[Math.cos(a)*r+s,Math.sin(a)*r+s*.8,(Math.random()-.5)*.25],c:[c.r,c.g,c.b]};},.035);
+const smoke=()=>points(1800,()=>{
+  const v=rnd().multiplyScalar(Math.random()**.5*.9), c=new THREE.Color().setHSL(Math.random()*.06,.9,.5);
+  return {p:[v.x,v.y,v.z],c:[c.r,c.g,c.b]};},.06);
+
+// ---- wrap a model: normalise size + collect parts for the scatter effect ----
+function prep(obj){
+  const w=new THREE.Group(); w.add(obj);
+  const b=new THREE.Box3().setFromObject(obj), sz=b.getSize(new THREE.Vector3()), c=b.getCenter(new THREE.Vector3());
+  obj.position.sub(c); w.scale.setScalar(1.8/Math.max(sz.x,sz.y,sz.z,1e-6));
+  w.updateMatrixWorld(true);
+  const parts=[], v=new THREE.Vector3();
+  obj.traverse(o=>{
+    if(o.isPoints){
+      const b0=Float32Array.from(o.geometry.attributes.position.array), d=b0.map(()=>(Math.random()-.5)*6);
+      parts.push({o,pts:1,b:b0,d,k:1/o.getWorldScale(v).x});
+    }else if(o.isMesh&&o.parent){
+      parts.push({o,b:o.position.clone(),r:o.rotation.clone(),d:rnd(),k:1/o.parent.getWorldScale(v).x});
+    }
+  });
+  w.userData={parts,last:-1};
+  return w;
+}
+function scatterModel(w,sc){
+  if(Math.abs(sc-w.userData.last)<1e-3) return; w.userData.last=sc;
+  for(const p of w.userData.parts){
+    if(p.pts){
+      const a=p.o.geometry.attributes.position; for(let i=0;i<a.array.length;i++) a.array[i]=p.b[i]+p.d[i]*sc*p.k*.5;
+      a.needsUpdate=true;
+    }else{
+      p.o.position.copy(p.b).addScaledVector(p.d,sc*2.2*p.k);
+      p.o.rotation.set(p.r.x+p.d.x*sc*4,p.r.y+p.d.y*sc*4,p.r.z+p.d.z*sc*4);
+    }
+  }
+}
+let models=[prep(flower()),prep(galaxy()),prep(smoke())], idx=0;
+models.forEach(m=>holder.add(m));
+
+// ---- load your own .fbx / .glb (+ their textures) from the device ----
+$('files').onchange=async e=>{
+  const fs=[...e.target.files], map=new Map();
+  fs.forEach(f=>map.set(f.name.toLowerCase(),URL.createObjectURL(f)));
+  const mgr=new THREE.LoadingManager();
+  mgr.setURLModifier(u=>map.get(decodeURIComponent(u.split(/[?#]/)[0].split(/[\\/]/).pop()).toLowerCase())||u);
+  const mf=fs.filter(f=>/\.(fbx|glb|gltf)$/i.test(f.name)).sort((a,b)=>a.name.localeCompare(b.name));
+  if(!mf.length){hud.textContent='Pick .fbx/.glb files together with their textures'; return;}
+  hud.textContent='Loading models…'; const out=[];
+  for(const f of mf){
+    try{
+      const u=map.get(f.name.toLowerCase());
+      const obj=/\.fbx$/i.test(f.name)?await new FBXLoader(mgr).loadAsync(u):(await new GLTFLoader(mgr).loadAsync(u)).scene;
+      out.push(prep(obj));
+    }catch(err){console.error(err); hud.textContent='Failed: '+f.name;}
+  }
+  if(out.length){models.forEach(m=>holder.remove(m)); models=out; models.forEach(m=>holder.add(m)); idx=0;}
+};
+
+// ---- gestures ----
+const st={box:0,sc:0,open:0,fist:0,px:.5,py:.5,pz:.15,n:0};
+const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const fingers=l=>[[8,6],[12,10],[16,14],[20,18]].filter(([t,p])=>d(l[t],l[0])>d(l[p],l[0])*EXT).length;
+function update(res){
+  const hs=(res.landmarks||[]).map(l=>l.map(p=>({x:1-p.x,y:p.y})));   // mirrored like the video
+  let L,R;
+  if(hs.length==2) [L,R]=hs.sort((a,b)=>a[0].x-b[0].x);
+  else if(hs.length==1) (hs[0][0].x<.5?(L=hs[0]):(R=hs[0]));
+  if(L){                                      // LEFT: thumb+index spread = open box, index tip = pointer
+    const palm=d(L[0],L[9])||1e-3, gap=d(L[4],L[8])/palm;
+    if(gap>OPEN_T) st.open=1; else if(gap<CLOSE_T) st.open=0;
+    st.px+=(L[8].x-st.px)*SMOOTH; st.py+=(L[8].y-st.py)*SMOOTH; st.pz+=(palm-st.pz)*SMOOTH;
+  }
+  let tgt=0;
+  if(R){                                      // RIGHT: open palm = scatter, fist = next model
+    st.n=fingers(R); tgt=st.n>=4?1:0;
+    const f=st.n===0?1:0; if(f&&!st.fist) idx=(idx+1)%models.length; st.fist=f;
+  }else st.fist=0;
+  st.box+=(st.open-st.box)*EASE; st.sc+=(tgt-st.sc)*EASE;
+}
+
+// ---- main loop ----
+let hl, res={landmarks:[]}, lastT=-1, fr=0;
+function loop(t){
+  requestAnimationFrame(loop);
+  if(hl&&vid.readyState>=2&&vid.currentTime!==lastT){lastT=vid.currentTime; res=hl.detectForVideo(vid,performance.now());}
+  update(res);
+  const H=2*Math.tan(FOV/2*Math.PI/180)*CAMZ, W=H*cam.aspect, s=Math.max(st.box,1e-4);
+  holder.position.set((st.px-.5)*W,(.5-st.py)*H,THREE.MathUtils.clamp((st.pz-.12)*25,-3,2.5));
+  holder.rotation.y=Math.sin(t/1200)*.3;
+  holder.scale.setScalar(s); cube.scale.setScalar(s);
+  models.forEach((m,i)=>{m.visible=i===idx; if(i===idx) scatterModel(m,st.sc);});
+  renderer.render(scene,cam);
+  if(hl&&++fr%10==0) hud.textContent=`${st.open?'box open':'box closed'} · model ${idx+1}/${models.length} · scatter ${st.sc.toFixed(1)}`;
+}
+requestAnimationFrame(loop);
+
+// ---- camera + MediaPipe ----
+$('start').onclick=async()=>{
+  $('start').disabled=true; hud.textContent='Starting camera…';
+  try{
+    vid.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:1280,height:720},audio:false});
+    await vid.play(); resize(); hud.textContent='Loading hand model…';
+    const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const mk=del=>HandLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:del},runningMode:'VIDEO',numHands:2});
+    try{hl=await mk('GPU');}catch{hl=await mk('CPU');}
+    $('start').style.display='none'; hud.textContent='Spread thumb + index (left hand) to open the box';
+  }catch(err){hud.textContent='Error: '+err.message; $('start').disabled=false;}
+};
+</script></body></html>
